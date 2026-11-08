@@ -1,0 +1,111 @@
+name: seal-build
+
+# Upstream golang.org/x/text ships no GitHub Actions CI (the project is developed
+# on Gerrit and tested by the Go build dashboard), so this workflow is authored
+# from scratch. It mirrors what the project itself does: `go build ./...` and
+# `go test ./...` against the toolchain contemporary with the v0.3.7 release,
+# plus the canonical module-zip packing that the module proxy performs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go package/test selector (e.g. ./unicode/norm/...); empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      # Built as its own module in a temp dir OUTSIDE the checkout, so its
+      # go.mod/go.sum can never land in the module zip.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/main.go"
+          cd "$HELPER"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          # zip.CreateFromDir skips .git but descends into .github. Upstream
+          # x/text ships no .github, so the whole dir is ours and must not
+          # appear in the artifact.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/text v0.3.7 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.3.7.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.3.7.zip" | tail -n 5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.3.7.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both legs run Go 1.17, the toolchain contemporary with the v0.3.7
+        # release (August 2021; go.mod declares go 1.17). A newer toolchain is
+        # not an option: message/pipeline drives the pinned 2018
+        # golang.org/x/tools go/ssa over the standard library, which panics on
+        # the generic stdlib of Go 1.18+ ("types.Type is nil, not
+        # *types.Signature").
+        # macOS: Go's internal linker before 1.22 emits Mach-O binaries with no
+        # LC_UUID load command, which current macOS dyld refuses to load
+        # ("missing LC_UUID load command" / "signal: abort trap"). Linking via
+        # the system linker (-linkmode=external) adds LC_UUID; this changes
+        # only how test binaries are linked, not what is compiled or tested.
+        include:
+          - os: ubuntu-latest
+            go-version: "1.17"
+            ldflags: ""
+          - os: macos-latest
+            go-version: "1.17"
+            ldflags: "-linkmode=external"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Go version
+        run: |
+          set -eux
+          go version
+          go env GOOS GOARCH
+
+      - name: Build
+        run: |
+          set -eux
+          go build -ldflags="${{ matrix.ldflags }}" ./...
+
+      - name: Test
+        run: |
+          set -eux
+          go test -ldflags="${{ matrix.ldflags }}" ${{ inputs.test-filter || './...' }}
