@@ -147,6 +147,7 @@ func update(b *language.Builder, part ...interface{}) (err error) {
 }
 
 var errInvalidWeight = errors.New("ParseAcceptLanguage: invalid weight")
+var errTagListTooLarge = errors.New("tag list exceeds max length")
 
 // ParseAcceptLanguage parses the contents of an Accept-Language header as
 // defined in http://www.ietf.org/rfc/rfc2616.txt and returns a list of Tags and
@@ -163,6 +164,12 @@ func ParseAcceptLanguage(s string) (tag []Tag, q []float32, err error) {
 			err = language.ErrSyntax
 		}
 	}()
+
+	// The BCP 47 scanner aliases '_' to '-' in scanner.init
+	// (internal/language/parse.go); the guard must count both.
+	if strings.Count(s, "-")+strings.Count(s, "_") > 1000 {
+		return nil, nil, errTagListTooLarge
+	}
 
 	var entry string
 	for s != "" {
